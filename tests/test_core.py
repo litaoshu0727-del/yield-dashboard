@@ -3,7 +3,7 @@ import sqlite3
 import numpy as np
 import pytest
 
-from yielddash import queries, spc, yieldmodel
+from yielddash import classify, queries, spc, yieldmodel
 from yielddash.etl import build_db, classify_lots, decode_map, encode_map, relation
 from yielddash.synthetic import LOTS_PER_PRODUCT, SHIFT_LOTS, TREND_START, WAFERS_PER_LOT, make_frame
 
@@ -224,3 +224,114 @@ def test_implied_d0_inverts_the_models():
 def test_die_area_scales_inversely_with_die_count():
     assert yieldmodel.die_area_cm2(1000) == pytest.approx(np.pi * 14.7 ** 2 / 1000)
     assert yieldmodel.die_area_cm2(500) == pytest.approx(2 * yieldmodel.die_area_cm2(1000))
+
+
+def test_ewma_and_cusum_catch_a_small_shift_sooner_than_rule_1():
+    rng = np.random.default_rng(0)
+    delays = {"rule1": [], "ewma": [], "cusum": []}
+    for _ in range(200):
+        x = rng.normal(0, 1, 260)
+        x[160:] -= 1.0                                        # one-sigma drop after lot 160
+        alarms = {"rule1": spc.control_chart(x, 100)["rule1"], "ewma": spc.ewma_chart(x, 100)["signal"],
+                  "cusum": spc.cusum_chart(x, 100)["cusum_low"] > 5}
+        for name, signal in alarms.items():
+            hit = spc.first_alarm(signal, 160)
+            delays[name].append(100 if hit is None else hit - 160)
+    median = {k: np.median(v) for k, v in delays.items()}
+    assert median["ewma"] < median["rule1"] / 2 and median["cusum"] < median["rule1"] / 2
+
+
+def test_clipping_keeps_one_scrapped_lot_out_of_ewma_and_cusum():
+    x = np.random.default_rng(3).normal(0, 1, 200)
+    x[150] = -16                                          # one catastrophic lot, no shift
+    assert spc.control_chart(x, 100)["rule1"][150]
+    assert (spc.cusum_chart(x, 100, clip=None)["cusum_low"] > 5).any()
+    assert not (spc.cusum_chart(x, 100)["cusum_low"][150:] > 5).any()
+    assert not spc.ewma_chart(x, 100)["signal"][150:].any()
+
+
+def test_ewma_limits_widen_to_their_steady_state():
+    chart = spc.ewma_chart(np.random.default_rng(1).normal(0, 1, 200), lam=0.2, L=3)
+    width = (chart["ucl"] - chart["lcl"]).to_numpy() / 2
+    sigma = chart.attrs["sigma"]
+    assert width[0] == pytest.approx(3 * sigma * 0.2)                       # first point: lam * sigma
+    assert width[-1] == pytest.approx(3 * sigma * np.sqrt(0.2 / 1.8), rel=1e-6)
+    assert np.all(np.diff(width) >= 0)
+
+
+def test_cusum_dates_the_start_of_a_shift():
+    x = np.random.default_rng(2).normal(0, 1, 300) * 0.3
+    x[150:200] -= 2.0                                     # a shift that lasts lots 150-199
+    chart = spc.cusum_chart(x, baseline=100)
+    episodes = spc.cusum_episodes(chart, "low")
+    first = episodes[episodes["alarm"] >= 150].iloc[0]
+    assert 147 <= first["onset"] <= 151 and first["alarm"] <= 156
+    assert 197 <= first["peak"] <= 201 and first["end"] > first["peak"]
+    assert chart.loc[first["alarm"], "onset"] == first["onset"]
+
+
+CLASSES = ["Center", "Donut", "Edge-Loc", "Edge-Ring", "Loc", "Near-full", "Random", "Scratch", "none"]
+
+
+def edge_ring_stub(X):
+    """Stand-in classifier: 'Edge-Ring' (0.95) when the outer ring fails a lot, else 'none' (0.6)."""
+    n = X.shape[1]
+    yy, xx = np.mgrid[0:n, 0:n]
+    ring = np.hypot(xx - (n - 1) / 2, yy - (n - 1) / 2) > 0.38 * n
+    die = (X > 0) & ring
+    edge_fail = ((X == 2) & ring).sum((1, 2)) / np.maximum(die.sum((1, 2)), 1)
+    proba = np.full((len(X), len(CLASSES)), 0.0)
+    hit = edge_fail > 0.3
+    proba[hit, CLASSES.index("Edge-Ring")] = 0.95
+    proba[~hit, CLASSES.index("none")] = 0.6
+    return proba
+
+
+@pytest.fixture(scope="module")
+def scored(tmp_path_factory):
+    path = tmp_path_factory.mktemp("scored") / "demo.db"
+    build_db(make_frame(seed=0), path)
+    n = classify.score_db(path, edge_ring_stub, CLASSES, 32, {"model": "stub"}, batch=500)
+    con = queries.connect(path)
+    yield con, n
+    con.close()
+
+
+def test_every_wafer_gets_one_prediction(scored):
+    con, n = scored
+    assert n == con.execute("SELECT COUNT(*) FROM wafers").fetchone()[0]
+    assert con.execute("SELECT COUNT(DISTINCT wafer_id) FROM predictions").fetchone()[0] == n
+    assert queries.model_info(con) == {"model": "stub"}
+
+
+def test_predicted_pareto_finds_the_planted_edge_ring_lots(scored, db):
+    con, _ = scored
+    product = product_with_grid(con, 26)
+    pareto = queries.pattern_pareto(con, product, source="model", min_confidence=0.9)
+    assert pareto["pattern"].tolist() == ["Edge-Ring"]
+    # every wafer of the 16 shifted lots, against ~30% of them for the engineer labels
+    assert pareto["n_wafers"].iloc[0] == len(SHIFT_LOTS) * WAFERS_PER_LOT
+    labeled = queries.label_coverage(con, product)
+    predicted = queries.label_coverage(con, product, source="model", min_confidence=0.0)
+    assert predicted["labeled"] == predicted["wafers"] > labeled["labeled"]
+    # a threshold above every confidence leaves nothing
+    assert queries.label_coverage(con, product, source="model", min_confidence=0.99)["labeled"] == 0
+
+
+def test_lot_patterns_and_drill_down_carry_predictions(scored):
+    con, _ = scored
+    trend = queries.lot_trend(con, product_with_grid(con, 26))
+    shifted = trend.iloc[list(SHIFT_LOTS)]["lot_id"].tolist()
+    normal = trend.iloc[:5]["lot_id"].tolist()
+    lp = queries.lot_patterns(con, shifted + normal)
+    assert set(lp["lot_id"]) == set(shifted) and (lp["pattern"] == "Edge-Ring").all()
+    assert (lp["n_wafers"] == WAFERS_PER_LOT).all()
+    wafers = queries.lot_wafers(con, shifted[0])
+    assert (wafers["predicted"] == "Edge-Ring").all() and wafers["confidence"].min() == pytest.approx(0.95)
+
+
+def test_queries_work_without_predictions(db):
+    con, *_ = db
+    assert not queries.has_predictions(con) and queries.model_info(con) == {}
+    assert queries.lot_wafers(con, "lot1")["predicted"].isna().all()
+    assert queries.lot_patterns(con, ["lot1"]).empty

@@ -50,16 +50,45 @@ def lot_trend(con: sqlite3.Connection, product_id: str, min_wafers: int = 1,
     """, con, params=(product_id, test_step, min_wafers))
 
 
-def pattern_pareto(con: sqlite3.Connection, product_id: str | None = None,
-                   test_step: str = "first") -> pd.DataFrame:
-    """Failing dies by labeled defect pattern, largest first, with cumulative share."""
-    where = "AND product_id = ?" if product_id else ""
-    params = (test_step, product_id) if product_id else (test_step,)
+def has_predictions(con: sqlite3.Connection) -> bool:
+    """True when yielddash.classify has stored model predictions in this database."""
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'predictions'").fetchone() is not None
+
+
+def model_info(con: sqlite3.Connection) -> dict:
+    return dict(con.execute("SELECT key, value FROM model_info").fetchall()) if has_predictions(con) else {}
+
+
+def _pattern_source(source: str) -> tuple[str, str]:
+    """FROM clause and pattern expression for engineer labels or model predictions."""
+    if source == "label":
+        return "wafers AS w", "w.pattern"
+    if source == "model":
+        return "wafers AS w JOIN predictions AS pr USING (wafer_id)", \
+               "CASE WHEN pr.confidence >= :min_conf THEN pr.pattern END"
+    raise ValueError(f"unknown source {source!r}")
+
+
+def pattern_pareto(con: sqlite3.Connection, product_id: str | None = None, test_step: str = "first",
+                   source: str = "label", min_confidence: float = 0.0) -> pd.DataFrame:
+    """Failing dies by defect pattern, largest first, with cumulative share.
+
+    `source="label"` uses the engineers' labels; `source="model"` uses the
+    stored predictions, counting a wafer only when the model's confidence is
+    at least `min_confidence`.
+    """
+    table, pattern = _pattern_source(source)
+    where = "AND w.product_id = :product" if product_id else ""
     return pd.read_sql(f"""
-        WITH loss AS (
+        WITH tagged AS (
+            SELECT {pattern} AS pattern, w.n_fail
+            FROM {table}
+            WHERE w.test_step = :step {where}
+        ),
+        loss AS (
             SELECT pattern, COUNT(*) AS n_wafers, SUM(n_fail) AS fail_dies
-            FROM wafers
-            WHERE test_step = ? AND pattern IS NOT NULL AND pattern <> 'none' {where}
+            FROM tagged
+            WHERE pattern IS NOT NULL AND pattern <> 'none'
             GROUP BY pattern
         )
         SELECT pattern,
@@ -70,21 +99,49 @@ def pattern_pareto(con: sqlite3.Connection, product_id: str | None = None,
                    / SUM(fail_dies) OVER ()                                                AS cum_share
         FROM loss
         ORDER BY fail_dies DESC, pattern
-    """, con, params=params)
+    """, con, params={"step": test_step, "product": product_id, "min_conf": min_confidence})
 
 
-def label_coverage(con: sqlite3.Connection, product_id: str | None = None,
-                   test_step: str = "first") -> pd.Series:
-    """How many wafers carry a label at all: the Pareto only describes those."""
-    where = "AND product_id = ?" if product_id else ""
-    params = (test_step, product_id) if product_id else (test_step,)
+def label_coverage(con: sqlite3.Connection, product_id: str | None = None, test_step: str = "first",
+                   source: str = "label", min_confidence: float = 0.0) -> pd.Series:
+    """How many wafers carry a pattern at all: the Pareto only describes those."""
+    table, pattern = _pattern_source(source)
+    where = "AND w.product_id = :product" if product_id else ""
     return pd.read_sql(f"""
+        WITH tagged AS (
+            SELECT {pattern} AS pattern FROM {table} WHERE w.test_step = :step {where}
+        )
         SELECT COUNT(*)                                                    AS wafers,
                COALESCE(SUM(pattern IS NOT NULL), 0)                       AS labeled,
                COALESCE(SUM(pattern IS NOT NULL AND pattern <> 'none'), 0) AS patterned
-        FROM wafers
-        WHERE test_step = ? {where}
-    """, con, params=params).iloc[0]
+        FROM tagged
+    """, con, params={"step": test_step, "product": product_id, "min_conf": min_confidence}).iloc[0]
+
+
+def lot_patterns(con: sqlite3.Connection, lot_ids: list[str], min_confidence: float = 0.9) -> pd.DataFrame:
+    """Per lot, the most common confidently predicted defect pattern and how many wafers show it.
+
+    Lots where no wafer has a confident non-'none' prediction get no row.
+    """
+    if not lot_ids or not has_predictions(con):
+        return pd.DataFrame(columns=["lot_id", "pattern", "n_wafers", "lot_wafers"])
+    marks = ",".join("?" * len(lot_ids))
+    return pd.read_sql(f"""
+        WITH counted AS (
+            SELECT w.lot_id, pr.pattern, COUNT(*) AS n_wafers
+            FROM wafers AS w JOIN predictions AS pr USING (wafer_id)
+            WHERE w.lot_id IN ({marks}) AND pr.pattern <> 'none' AND pr.confidence >= ?
+            GROUP BY w.lot_id, pr.pattern
+        ),
+        ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY lot_id ORDER BY n_wafers DESC, pattern) AS rank
+            FROM counted
+        )
+        SELECT r.lot_id, r.pattern, r.n_wafers,
+               (SELECT COUNT(*) FROM wafers AS w2 WHERE w2.lot_id = r.lot_id) AS lot_wafers
+        FROM ranked AS r
+        WHERE rank = 1
+    """, con, params=[*lot_ids, min_confidence])
 
 
 def kpis(con: sqlite3.Connection, product_id: str | None = None, test_step: str = "first") -> pd.Series:
@@ -101,13 +158,21 @@ def kpis(con: sqlite3.Connection, product_id: str | None = None, test_step: str 
 
 
 def lot_wafers(con: sqlite3.Connection, lot_id: str) -> pd.DataFrame:
-    """Every wafer of one lot, with its compressed map and the grid size needed to decode it."""
-    return pd.read_sql("""
+    """Every wafer of one lot, with its compressed map and the grid size needed to decode it.
+
+    `predicted` and `confidence` are NULL when no predictions are stored.
+    """
+    if has_predictions(con):
+        join, cols = "LEFT JOIN predictions AS pr USING (wafer_id)", "pr.pattern AS predicted, pr.confidence"
+    else:
+        join, cols = "", "NULL AS predicted, NULL AS confidence"
+    return pd.read_sql(f"""
         SELECT w.slot, w.product_id, w.test_step, w.n_die, w.n_fail,
                1.0 - 1.0 * w.n_fail / w.n_die AS yield,
-               w.pattern, w.map, p.n_rows, p.n_cols
+               w.pattern, {cols}, w.map, p.n_rows, p.n_cols
         FROM wafers AS w
         JOIN products AS p USING (product_id)
+        {join}
         WHERE w.lot_id = ?
         ORDER BY w.slot
     """, con, params=(lot_id,))

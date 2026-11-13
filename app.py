@@ -23,6 +23,7 @@ ROOT = Path(__file__).parent
 DATABASES = {"WM-811K (real fab data)": ROOT / "data" / "yield.db",
              "Synthetic demo": ROOT / "data" / "demo.db"}
 MIN_LOTS = 50  # products with fewer lots are too short a history to chart
+MODEL_CONFIDENCE = 0.9  # default: predictions below this would go to manual review
 STEPS = {"first": "First test (use this for monitoring)",
          "repeat": "Repeat record of the same wafers",
          "retest": "Retest record (few fails)"}
@@ -68,9 +69,11 @@ def load_trend(path: str, product: str, min_wafers: int, step: str) -> pd.DataFr
 
 
 @st.cache_data
-def load_pareto(path: str, product: str, step: str) -> tuple[pd.DataFrame, pd.Series]:
+def load_pareto(path: str, product: str, step: str, source: str = "label",
+                min_conf: float = 0.0) -> tuple[pd.DataFrame, pd.Series]:
     con = connection(path)
-    return queries.pattern_pareto(con, product, step), queries.label_coverage(con, product, step)
+    return (queries.pattern_pareto(con, product, step, source, min_conf),
+            queries.label_coverage(con, product, step, source, min_conf))
 
 
 # ------------------------------------------------------------------ charts
@@ -105,6 +108,56 @@ def spc_figure(trend: pd.DataFrame, chart: pd.DataFrame, baseline: int | None) -
     styled(fig, 420, "Lot (in lot-number order)", "Lot yield")
     fig.update_layout(margin=dict(r=96))
     fig.update_yaxes(range=[max(0, min(trend["yield"].min(), center - 3.5 * sigma) - 0.01), 1.0])
+    return fig
+
+
+def ewma_figure(trend: pd.DataFrame, ewma: pd.DataFrame, baseline: int | None) -> go.Figure:
+    center = ewma.attrs["center"]
+    fig = go.Figure()
+    fig.add_trace(go.Scattergl(
+        x=trend["run"], y=trend["yield"], mode="markers", name="Lot yield",
+        marker=dict(color=AXIS, size=4), customdata=trend[["lot_id"]],
+        hovertemplate="Lot %{customdata[0]}<br>Yield %{y:.1%}<extra></extra>"))
+    for column, name in (("ucl", "Upper limit"), ("lcl", "Lower limit")):
+        fig.add_trace(go.Scatter(x=trend["run"], y=ewma[column], mode="lines", name=name, showlegend=False,
+                                 line=dict(color=MUTED, width=1), hoverinfo="skip"))
+    fig.add_trace(go.Scattergl(
+        x=trend["run"], y=ewma["ewma"], mode="lines", name=f"EWMA (lambda {ewma.attrs['lam']})",
+        line=dict(color=BLUE, width=2), customdata=trend[["lot_id"]],
+        hovertemplate="Lot %{customdata[0]}<br>EWMA %{y:.1%}<extra></extra>"))
+    for side, name, marker in (
+            ("low", "Below lower limit", dict(color=CRITICAL, size=8, line=dict(color=SURFACE, width=1.5))),
+            ("high", "Above upper limit", dict(color=SURFACE, size=7, line=dict(color=INK_2, width=1.5)))):
+        pick = ewma["signal"].to_numpy() & (ewma["side"].to_numpy() == side)
+        fig.add_trace(go.Scatter(x=trend.loc[pick, "run"], y=ewma.loc[pick, "ewma"], mode="markers", name=name,
+                                 marker=marker, customdata=trend.loc[pick, ["lot_id"]],
+                                 hovertemplate="Lot %{customdata[0]}<br>EWMA %{y:.1%}<extra></extra>"))
+    fig.add_hline(y=center, line=dict(color=MUTED, width=1, dash="dot"), annotation_text=f"CL {center:.1%}",
+                  annotation_position="right", annotation_font=dict(color=INK_2, size=12))
+    if baseline and baseline < len(trend):
+        fig.add_vline(x=baseline + 0.5, line=dict(color=AXIS, width=1))
+    styled(fig, 420, "Lot (in lot-number order)", "Yield")
+    fig.update_layout(margin=dict(r=96))
+    sigma = ewma.attrs["sigma"]
+    fig.update_yaxes(range=[max(0, center - 4 * sigma), min(1, center + 4 * sigma)])
+    return fig
+
+
+def cusum_figure(trend: pd.DataFrame, cusum: pd.DataFrame, baseline: int | None) -> go.Figure:
+    h = cusum.attrs["h"]
+    fig = go.Figure()
+    for column, name, color in (("cusum_low", "Low side (yield dropping)", BLUE),
+                                ("cusum_high", "High side (yield rising)", ORANGE)):
+        fig.add_trace(go.Scattergl(
+            x=trend["run"], y=cusum[column], mode="lines", name=name, line=dict(color=color, width=2),
+            customdata=trend[["lot_id"]],
+            hovertemplate="Lot %{customdata[0]}<br>" + name + ": %{y:.1f}<extra></extra>"))
+    fig.add_hline(y=h, line=dict(color=MUTED, width=1), annotation_text=f"h = {h:g}",
+                  annotation_position="right", annotation_font=dict(color=INK_2, size=12))
+    if baseline and baseline < len(trend):
+        fig.add_vline(x=baseline + 0.5, line=dict(color=AXIS, width=1))
+    styled(fig, 380, "Lot (in lot-number order)", "Cumulative sum (sigma units)", percent_y=False)
+    fig.update_layout(margin=dict(r=96))
     return fig
 
 
@@ -160,7 +213,7 @@ def wafer_gallery(wafers: pd.DataFrame):
     cmap = ListedColormap([SURFACE, GRID, CRITICAL])  # no die / pass / fail
     columns = 5
     rows = int(np.ceil(len(wafers) / columns))
-    fig, axes = plt.subplots(rows, columns, figsize=(2.1 * columns, 2.35 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, columns, figsize=(2.1 * columns, 2.6 * rows), squeeze=False)
     fig.patch.set_facecolor(SURFACE)
     for ax in axes.ravel():
         ax.axis("off")
@@ -168,8 +221,10 @@ def wafer_gallery(wafers: pd.DataFrame):
         ax.imshow(decode_map(w["map"], w["n_rows"], w["n_cols"]), cmap=cmap, vmin=0, vmax=2,
                   interpolation="nearest")
         label = f"Slot {w['slot']} · {w['yield']:.0%}"
-        if w["pattern"] and w["pattern"] != "none":
-            label += f"\n{w['pattern']}"
+        if pd.notna(w["pattern"]) and w["pattern"] != "none":
+            label += f"\nLabel: {w['pattern']}"
+        elif pd.notna(w["predicted"]) and w["predicted"] != "none":
+            label += f"\nModel: {w['predicted']} {w['confidence']:.2f}"
         ax.set_title(label, fontsize=9, color=INK_2)
     fig.tight_layout()
     return fig
@@ -220,6 +275,8 @@ with st.sidebar:
     diameter = st.selectbox("Assumed wafer diameter (mm)", [300, 200, 150], index=0,
                             help="WM-811K does not state it. It only rescales die area and D0.")
 
+has_model = queries.has_predictions(connection(db_path))
+model_meta = queries.model_info(connection(db_path))
 chart = spc.control_chart(trend["yield"], baseline or None)
 low = (chart["signal"] > 0) & (chart["side"] == "low")
 high = (chart["signal"] > 0) & (chart["side"] == "high")
@@ -238,30 +295,82 @@ k4.metric("Lots with a low-yield signal", f"{int(low.sum()):,} ({low.mean():.1%}
 tab_spc, tab_pareto, tab_lot, tab_model = st.tabs(["Control chart", "Defect Pareto", "Lot drill-down", "Yield model"])
 
 with tab_spc:
-    st.subheader("Lot yield, individuals chart")
-    st.caption("Limits are the baseline mean ± 3 sigma, with sigma estimated from the moving range. "
-               "Marked points complete one of the four Western Electric run rules: red below the centre "
-               "line, hollow above it.")
-    show(spc_figure(trend, chart, baseline or None))
+    kind = st.radio("Chart", ["Individuals", "EWMA", "CUSUM"], horizontal=True,
+                    help="Individuals catches single bad lots. EWMA and CUSUM catch a small shift in the "
+                         "yield level that lasts, typically several times sooner.")
+    if kind == "Individuals":
+        st.subheader("Lot yield, individuals chart")
+        st.caption("Limits are the baseline mean ± 3 sigma, with sigma estimated from the moving range. "
+                   "Marked points complete one of the four Western Electric run rules: red below the centre "
+                   "line, hollow above it.")
+        show(spc_figure(trend, chart, baseline or None))
 
-    counts = pd.DataFrame({
-        "Rule": [f"{r}. {text.split(',')[0]}" for r, text in spc.RULES.items()],
-        "Low side": [int((chart[f"rule{r}"] & (chart["side"] == "low")).sum()) for r in spc.RULES],
-        "High side": [int((chart[f"rule{r}"] & (chart["side"] == "high")).sum()) for r in spc.RULES],
-    })
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Signals by rule**")
-        st.dataframe(counts, hide_index=True, width="stretch")
-        st.caption(f"{int(high.sum()):,} lots signal on the high side. A lot can trip more than one rule.")
-    with right:
-        st.markdown("**Lots with a low-yield signal, worst first**")
-        flagged = trend.loc[low, ["lot_id", "run", "n_wafers", "yield", "min_wafer_yield"]].assign(
-            rule=chart.loc[low, "signal"].map(spc.RULES)).sort_values("yield")
-        st.dataframe(flagged, hide_index=True, width="stretch", height=212, column_config={
-            "lot_id": "Lot", "run": "Run", "n_wafers": "Wafers", "rule": "First rule tripped",
-            "yield": st.column_config.NumberColumn("Lot yield", format="percent"),
-            "min_wafer_yield": st.column_config.NumberColumn("Worst wafer", format="percent")})
+        counts = pd.DataFrame({
+            "Rule": [f"{r}. {text.split(',')[0]}" for r, text in spc.RULES.items()],
+            "Low side": [int((chart[f"rule{r}"] & (chart["side"] == "low")).sum()) for r in spc.RULES],
+            "High side": [int((chart[f"rule{r}"] & (chart["side"] == "high")).sum()) for r in spc.RULES],
+        })
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Signals by rule**")
+            st.dataframe(counts, hide_index=True, width="stretch")
+            st.caption(f"{int(high.sum()):,} lots signal on the high side. A lot can trip more than one rule.")
+        with right:
+            st.markdown("**Lots with a low-yield signal, worst first**")
+            flagged = trend.loc[low, ["lot_id", "run", "n_wafers", "yield", "min_wafer_yield"]].assign(
+                rule=chart.loc[low, "signal"].map(spc.RULES)).sort_values("yield")
+            config = {"lot_id": "Lot", "run": "Run", "n_wafers": "Wafers", "rule": "First rule tripped",
+                      "yield": st.column_config.NumberColumn("Lot yield", format="percent"),
+                      "min_wafer_yield": st.column_config.NumberColumn("Worst wafer", format="percent")}
+            if has_model:
+                lp = queries.lot_patterns(connection(db_path), flagged["lot_id"].tolist(), MODEL_CONFIDENCE)
+                lp["model_pattern"] = lp["pattern"] + " (" + lp["n_wafers"].astype(str) + "/" \
+                    + lp["lot_wafers"].astype(str) + ")"
+                flagged = flagged.merge(lp[["lot_id", "model_pattern"]], on="lot_id", how="left")
+                flagged["model_pattern"] = flagged["model_pattern"].fillna("no pattern")
+                config["model_pattern"] = st.column_config.TextColumn(
+                    "Model: main pattern", help=f"Most common pattern the classifier predicts with confidence "
+                                                f"≥ {MODEL_CONFIDENCE:.0%}, and on how many of the lot's wafers.")
+            order = ["lot_id", "yield"] + (["model_pattern"] if has_model else []) + \
+                ["min_wafer_yield", "n_wafers", "run", "rule"]
+            st.dataframe(flagged, hide_index=True, width="stretch", height=212, column_config=config,
+                         column_order=order)
+    elif kind == "EWMA":
+        ewma = spc.ewma_chart(trend["yield"], baseline or None)
+        st.subheader("Exponentially weighted moving average of lot yield")
+        st.caption(f"Each point averages the newest lot (weight {ewma.attrs['lam']}) with the previous average. "
+                   f"Lot yields are clipped to ± {ewma.attrs['clip']:g} sigma first, so a single scrapped lot, "
+                   "which the individuals chart already flags, does not pull the average down for the "
+                   "next several lots.")
+        show(ewma_figure(trend, ewma, baseline or None))
+        n_low = int((ewma["signal"] & (ewma["side"] == "low")).sum())
+        n_high = int((ewma["signal"] & (ewma["side"] == "high")).sum())
+        st.caption(f"{n_low:,} lots below the lower limit, {n_high:,} above the upper limit.")
+    else:
+        cusum = spc.cusum_chart(trend["yield"], baseline or None)
+        st.subheader("CUSUM of lot yield")
+        st.caption(f"Each sum adds up how far lots sit beyond {cusum.attrs['k']:g} sigma on its side of the centre "
+                   f"line and resets at zero; it signals above h = {cusum.attrs['h']:g}. "
+                   f"Each lot is clipped to ± {cusum.attrs['clip']:g} sigma, so it reacts to a lasting shift "
+                   "in level rather than to one bad lot.")
+        show(cusum_figure(trend, cusum, baseline or None))
+        runs = trend["run"].to_numpy()
+        rows = []
+        for side in ("low", "high"):
+            for e in spc.cusum_episodes(cusum, side).itertuples():
+                rows.append({"Direction": "Yield down" if side == "low" else "Yield up",
+                             "Shift starts (run)": int(runs[e.onset]), "Signal (run)": int(runs[e.alarm]),
+                             "Shift ends, estimated (run)": int(runs[e.peak]),
+                             "Lots in shift": int(e.peak - e.onset + 1),
+                             "Mean yield in shift": float(trend["yield"].iloc[e.onset:e.peak + 1].mean())})
+        st.markdown("**Shifts found**")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+                "Mean yield in shift": st.column_config.NumberColumn(format="percent")})
+            st.caption(f"Baseline centre line {cusum.attrs['center']:.1%}. The start is where the sum last "
+                       "left zero; the end is where it peaked.")
+        else:
+            st.caption("No lasting shift on either side.")
 
     st.subheader("Where on the wafer the fails are")
     st.caption("If the two lines separate, the loss is concentrated at the wafer edge or in the interior, "
@@ -269,13 +378,31 @@ with tab_spc:
     show(zone_figure(trend))
 
 with tab_pareto:
-    pareto, coverage = load_pareto(db_path, product, step)
     st.subheader("Yield loss by defect pattern")
-    st.caption(f"{int(coverage['labeled']):,} of {int(coverage['wafers']):,} wafer records of this kind carry an "
-               f"engineer's label, and {int(coverage['patterned']):,} of those show a pattern. "
-               "The chart covers only those patterned wafers.")
+    source, min_conf = "label", 0.0
+    if has_model:
+        left, right = st.columns([1, 1])
+        choice = left.radio("Patterns from", ["Engineer labels", "Classifier predictions"], horizontal=True,
+                            help="Predictions come from the CNN of the wafer-map-yield project, run on every "
+                                 "wafer offline (python -m yielddash.classify).")
+        if choice.startswith("Classifier"):
+            source = "model"
+            min_conf = right.slider("Minimum confidence", 0.5, 0.99, MODEL_CONFIDENCE, 0.01,
+                                    help="Wafers predicted with less confidence are left out, as they would "
+                                         "go to an engineer for review.")
+    pareto, coverage = load_pareto(db_path, product, step, source, min_conf)
+    if source == "label":
+        st.caption(f"{int(coverage['labeled']):,} of {int(coverage['wafers']):,} wafer records of this kind carry "
+                   f"an engineer's label, and {int(coverage['patterned']):,} of those show a pattern. "
+                   "The chart covers only those patterned wafers.")
+    else:
+        st.caption(f"The classifier is at least {min_conf:.0%} confident on {int(coverage['labeled']):,} of "
+                   f"{int(coverage['wafers']):,} wafer records, and calls a pattern on "
+                   f"{int(coverage['patterned']):,} of those. Model: {model_meta.get('source_run', '?')}, "
+                   f"test macro-F1 {model_meta.get('test_macro_f1', '?')} on held-out lots."
+                   + ("" if step == "first" else " It was trained on first-test records only."))
     if pareto.empty:
-        st.info("No labeled defect patterns for this product.")
+        st.info("No defect patterns for this product.")
     else:
         show(pareto_figure(pareto))
         st.dataframe(pareto, hide_index=True, width="stretch", column_config={
@@ -291,10 +418,14 @@ with tab_lot:
     lot_id = st.selectbox("Lot (lowest yield first)", list(describe), format_func=describe.get)
     wafers = queries.lot_wafers(connection(db_path), lot_id)
     wafers = wafers[wafers["product_id"] == product]
-    st.caption(f"{len(wafers)} wafers · lot yield {describe[lot_id].split(' · ')[1]} · red dies failed")
+    st.caption(f"{len(wafers)} wafers · lot yield {describe[lot_id].split(' · ')[1]} · red dies failed"
+               + (" · titles show the engineer's label, or the classifier's prediction where unlabeled"
+                  if has_model else ""))
     st.pyplot(wafer_gallery(wafers), width="content")
-    st.dataframe(wafers[["slot", "n_die", "n_fail", "yield", "pattern"]], hide_index=True, column_config={
+    columns = ["slot", "n_die", "n_fail", "yield", "pattern"] + (["predicted", "confidence"] if has_model else [])
+    st.dataframe(wafers[columns], hide_index=True, column_config={
         "slot": "Slot", "n_die": "Dies", "n_fail": "Failing dies", "pattern": "Label",
+        "predicted": "Classifier", "confidence": st.column_config.NumberColumn("Confidence", format="%.2f"),
         "yield": st.column_config.NumberColumn("Yield", format="percent")})
 
 with tab_model:
