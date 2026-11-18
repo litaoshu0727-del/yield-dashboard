@@ -1,5 +1,7 @@
 # 良率监控看板 (yield-dashboard)
 
+[![tests](https://github.com/litaoshu0727-del/yield-dashboard/actions/workflows/tests.yml/badge.svg)](https://github.com/litaoshu0727-del/yield-dashboard/actions/workflows/tests.yml)
+
 **一句话**:把 81 万片真实晶圆的测试数据存进 SQLite,用 SPC 控制图监控每个产品的批次良率,报警批次可以一路下钻到单片晶圆图。
 
 | 做了什么 | 结果 |
@@ -28,8 +30,8 @@
 
 ```bash
 pip install -e ".[dev]"
-pytest                                                   # 28 项测试
 python -m yielddash.etl --synthetic --db data/demo.db    # 不需要数据集的演示库
+pytest                                                   # 29 项测试,最后一项在演示库上把看板跑一遍
 streamlit run app.py
 ```
 
@@ -41,7 +43,7 @@ python -m yielddash.etl --source path/to/LSWMD.pkl --db data/yield.db
 
 建库约 40 秒,生成的数据库约 270 MB。
 
-可选:用 `wafer-map-yield` 项目训练好的 CNN 给每片晶圆打上缺陷模式(需要 PyTorch,81 万片在 CPU 上约 7 分钟):
+可选:用 [wafer-map-yield](https://github.com/litaoshu0727-del/wafer-map-yield) 项目训练好的 CNN 给每片晶圆打上缺陷模式(需要 PyTorch,81 万片在 CPU 上约 7 分钟):
 
 ```bash
 pip install -e ".[classify]"
@@ -108,7 +110,7 @@ EWMA 和 CUSUM(同一基线、同一 σ):
 
 工程师只标注了很少一部分晶圆:批次最多的产品 `32x29-710` 有 38,345 片首测晶圆,只有 287 片带标注。所以原来的缺陷 Pareto 只描述了不到 1% 的晶圆,批次下钻页也大多没有图案信息。
 
-接入的是 `wafer-map-yield` 项目的 CNN(5 个种子的测试集 macro-F1 0.854 ± 0.005),导出成独立的 `.pt2` 文件后离线打分,每片晶圆存一个最可能的类别和它的概率。看板里默认只采用置信度 ≥ 0.9 的预测,低于这个值的相当于交给人工复判。
+接入的是 [wafer-map-yield](https://github.com/litaoshu0727-del/wafer-map-yield) 项目的 CNN(5 个种子的测试集 macro-F1 0.854 ± 0.005),导出成独立的 `.pt2` 文件后离线打分,每片晶圆存一个最可能的类别和它的概率。看板里默认只采用置信度 ≥ 0.9 的预测,低于这个值的相当于交给人工复判。
 
 在 `32x29-710` 上:
 
@@ -140,7 +142,7 @@ EWMA 和 CUSUM(同一基线、同一 σ):
 
 ## 局限
 
-- 重复记录和复测的判定是从晶圆图推断的,阈值(80% 共同 slot、90% 包含、20% 失效数)是我定的,没有官方依据。不过结论对阈值不敏感:在 `wafer-map-yield` 项目里把四个阈值各扫了一遍,被判为重复或复测的批次数变动不超过 3%(见该项目 README 的"这些结论依赖我定的阈值吗")。
+- 重复记录和复测的判定是从晶圆图推断的,阈值(80% 共同 slot、90% 包含、20% 失效数)是我定的,没有官方依据。不过结论对阈值不敏感:在 `wafer-map-yield` 项目里把四个阈值各扫了一遍,被判为重复或复测的批次数变动不超过 3%(见该项目的[数据质量分析](https://github.com/litaoshu0727-del/wafer-map-yield/blob/main/docs/data-quality.md))。
 - 晶圆直径是假设的,只影响 die 面积和 D0 的绝对数值。
 - 良率模型是跨产品拟合的,而不同产品的工艺和成熟度不同,所以它只是粗略描述。产品列表和这一页的产品良率没有扣除上面说的近零失效批次。
 - 同一批次里如果晶圆的 die 数不同,会被拆到不同产品下。
@@ -159,11 +161,17 @@ EWMA 和 CUSUM(同一基线、同一 σ):
 | `yielddash/wm811k.py` | 读取 WM-811K 的旧格式文件 |
 | `yielddash/synthetic.py` | 带已知事件的合成数据(良率阶跃、缓慢漂移、重复记录) |
 
-## 简历写法模板
+## 数据来源
 
-- 搭建半导体良率监控看板(SQLite + Streamlit),覆盖 81 万片真实晶圆、154 个产品,支持从 SPC 报警批次下钻到单片晶圆图
-- 实现单值控制图(Western Electric 四条判异规则)、EWMA 和 CUSUM 三种控制图,模拟验证中 EWMA/CUSUM 对 1σ 持续下移的报警延迟从单值图的 35 批缩短到 9 批,误报率也更低
-- 发现真实批次良率的重尾会让 EWMA/CUSUM 被单个报废批次误触发,对输入做 ±3σ 截断后,确认批次最多的产品没有持续性良率下移,14 个低良率报警全部是单批事件,并用 CUSUM 定位出 4 段良率上移的起止批次
-- 通过逐片对比晶圆图,发现数据集中约 26% 的批次是同一批晶圆的重复或复测记录,设计规则将其分离,解决了控制图良率交替跳变、控制限失效的问题
-- 把晶圆图分类项目训练的 CNN 导出后接入看板,为 81 万片晶圆补上缺陷模式;按置信度门槛 0.9 过滤后,主力产品可用的缺陷图案样本从 287 片增至 1,198 片,14 个低良率报警批次全部给出主要缺陷模式
-- 拟合 Poisson、Murphy、Seeds、负二项四个良率模型,得到跨产品缺陷密度 D0 约 0.17–0.25 个/cm²
+用的是公开的 WM-811K 数据集,不包含在仓库里(获取方式见 [wafer-map-yield 的数据来源](https://github.com/litaoshu0727-del/wafer-map-yield#数据来源))。出处:
+
+M.-J. Wu, J.-S. R. Jang, J.-L. Chen, "Wafer Map Failure Pattern Recognition and Similarity Ranking for Large-Scale Data Sets," *IEEE Transactions on Semiconductor Manufacturing*, vol. 28, no. 1, pp. 1–12, 2015. [doi:10.1109/TSM.2014.2364237](https://doi.org/10.1109/TSM.2014.2364237)
+
+## 相关项目
+
+- [wafer-map-yield](https://github.com/litaoshu0727-del/wafer-map-yield):晶圆图良率分析和缺陷图案分类,看板里的 CNN 来自这里
+- [secom-root-cause](https://github.com/litaoshu0727-del/secom-root-cause):SECOM 产线数据的根因候选筛查
+
+## 许可
+
+代码使用 MIT 许可,见 [LICENSE](LICENSE)。数据集的使用请遵守其条款并引用原始论文。

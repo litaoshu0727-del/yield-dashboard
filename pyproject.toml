@@ -1,13 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "yield-dashboard"
 version = "0.1.0"
 description = "Yield monitoring dashboard: SQLite store, SPC run rules, yield models, Streamlit UI"
-requires-python = ">=3.10"
-dependencies = ["numpy", "pandas", "scipy", "streamlit>=1.40", "plotly>=5.20"]
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["numpy", "pandas", "scipy", "matplotlib", "streamlit>=1.40", "plotly>=5.20"]
 
 [project.optional-dependencies]
 classify = ["torch>=2.5"]  # only for yielddash.classify
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools]
 packages = ["yielddash"]
@@ -15,3 +20,6 @@ packages = ["yielddash"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]  # syntax errors and pyflakes (unused imports, undefined names)
