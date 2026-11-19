@@ -1,0 +1,8 @@
+# Dependencies for Streamlit Community Cloud, which installs from this file.
+# Keep in sync with [project] dependencies in pyproject.toml (a test checks this).
+numpy
+pandas
+scipy
+matplotlib
+streamlit>=1.40
+plotly>=5.20

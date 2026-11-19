@@ -15,6 +15,20 @@ REPEAT_PRODUCT = "B"         # every lot of this product is recorded again with 
 LATER_FAIL = 0.003           # chance a passing die fails at the later step
 
 
+def _grid(name: str) -> str:
+    n = PRODUCTS[name][0]
+    return f"{n}x{n}"
+
+
+SUMMARY = (
+    "Synthetic demo data, not real fab data. Three products with planted events: an edge-ring excursion "
+    f"in the {_grid('A')} product (lots {SHIFT_LOTS.start + 1}–{SHIFT_LOTS.stop} on the chart), a slow yield "
+    f"drift in the {_grid('B')} product from lot {TREND_START + 1} on, and later test records of "
+    f"the same wafers (repeat records in the {_grid(REPEAT_PRODUCT)} product, retest records in the "
+    f"{_grid(RETEST_PRODUCT)} product). The results in the README come from WM-811K, which is not included here."
+)
+
+
 def _wafer(n: int, p_fail: float, edge_extra: float, rng: np.random.Generator) -> np.ndarray:
     c = (n - 1) / 2
     yy, xx = np.mgrid[0:n, 0:n]

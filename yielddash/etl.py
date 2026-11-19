@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
+import tempfile
 import zlib
 from pathlib import Path
 
@@ -198,6 +200,25 @@ def build_db(frame: pd.DataFrame, db_path: str | Path) -> dict[str, int]:
             "retest_lots": sum(t == "retest" for t in tags.values())}
 
 
+def build_demo(db_path: str | Path) -> dict[str, int]:
+    """Build the synthetic demo database at `db_path`.
+
+    It is written to a temporary file and then moved into place, so a reader never sees a
+    half-built database, even when two processes build it at the same time.
+    """
+    from .synthetic import make_frame
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".db.tmp", dir=db_path.parent)
+    os.close(fd)
+    try:
+        stats = build_db(make_frame(), tmp)
+        os.replace(tmp, db_path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return stats
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", help="path to LSWMD.pkl")
@@ -206,14 +227,12 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.synthetic:
-        from .synthetic import make_frame
-        frame = make_frame()
+        stats = build_demo(args.db)
     elif args.source:
         from .wm811k import load_wm811k
-        frame = load_wm811k(args.source)
+        stats = build_db(load_wm811k(args.source), args.db)
     else:
         ap.error("give --source or --synthetic")
-    stats = build_db(frame, args.db)
     size_mb = Path(args.db).stat().st_size / 1e6
     print(f"{args.db}: {stats['wafers']} wafers, {stats['lots']} lots "
           f"({stats['repeat_lots']} tagged repeat, {stats['retest_lots']} retest), "

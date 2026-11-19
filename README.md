@@ -30,9 +30,8 @@
 
 ```bash
 pip install -e ".[dev]"
-python -m yielddash.etl --synthetic --db data/demo.db    # demo database, no dataset needed
-pytest                                                   # 29 tests; the last runs the dashboard on the demo database
-streamlit run app.py
+pytest                 # 31 tests; one starts the dashboard from an empty data folder, as the hosted demo does
+streamlit run app.py   # with no database, the app first builds a small synthetic demo database (a few seconds)
 ```
 
 With the real data (WM-811K `LSWMD.pkl`, about 2 GB):

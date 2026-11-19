@@ -32,9 +32,8 @@
 
 ```bash
 pip install -e ".[dev]"
-python -m yielddash.etl --synthetic --db data/demo.db    # 不需要数据集的演示库
-pytest                                                   # 29 项测试,最后一项在演示库上把看板跑一遍
-streamlit run app.py
+pytest                 # 31 项测试,其中一项像在线 demo 那样从空的数据目录启动看板
+streamlit run app.py   # 没有数据库时,看板会先自动生成一个小的合成演示库(几秒钟)
 ```
 
 用真实数据(WM-811K 的 `LSWMD.pkl`,约 2 GB):

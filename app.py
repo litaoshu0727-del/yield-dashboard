@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import matplotlib
@@ -17,11 +18,14 @@ import streamlit as st
 from matplotlib.colors import ListedColormap
 
 from yielddash import queries, spc, yieldmodel
-from yielddash.etl import decode_map
+from yielddash.etl import build_demo, decode_map
+from yielddash.synthetic import SUMMARY as DEMO_SUMMARY
 
 ROOT = Path(__file__).parent
-DATABASES = {"WM-811K (real fab data)": ROOT / "data" / "yield.db",
-             "Synthetic demo": ROOT / "data" / "demo.db"}
+DATA = Path(os.environ.get("YIELDDASH_DATA", ROOT / "data"))  # the tests point this at an empty folder
+DEMO = "Synthetic demo"
+DATABASES = {"WM-811K (real fab data)": DATA / "yield.db",
+             DEMO: DATA / "demo.db"}
 MIN_LOTS = 50  # products with fewer lots are too short a history to chart
 MODEL_CONFIDENCE = 0.9  # default: predictions below this would go to manual review
 STEPS = {"first": "First test (use this for monitoring)",
@@ -51,6 +55,12 @@ def styled(fig: go.Figure, height: int, x_title: str, y_title: str, percent_y: b
 
 def show(fig: go.Figure) -> None:
     st.plotly_chart(fig, theme=None, width="stretch", config={"displaylogo": False})
+
+
+@st.cache_resource(show_spinner="Building the synthetic demo database (first start only)…")
+def ensure_demo(path: str) -> None:
+    if not Path(path).exists():
+        build_demo(path)
 
 
 @st.cache_resource
@@ -235,9 +245,9 @@ def wafer_gallery(wafers: pd.DataFrame):
 st.set_page_config(page_title="Yield monitor", layout="wide")
 
 available = {name: path for name, path in DATABASES.items() if path.exists()}
-if not available:
-    st.error("No database found. Build one first: `python -m yielddash.etl --synthetic --db data/demo.db`")
-    st.stop()
+if not available:  # a fresh checkout, or the hosted demo: build the small synthetic database
+    ensure_demo(str(DATABASES[DEMO]))
+    available = {DEMO: DATABASES[DEMO]}
 
 with st.sidebar:
     st.header("Filters")
@@ -284,6 +294,8 @@ high = (chart["signal"] > 0) & (chart["side"] == "high")
 st.title("Yield monitor")
 st.caption(f"Product {product} · {STEPS[step].split(' (')[0].lower()} · lots in lot-number order"
            + (f" · {n_hidden:,} near-zero-fail lots hidden" if n_hidden else ""))
+if db_path == str(DATABASES[DEMO]):
+    st.info(DEMO_SUMMARY)
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Lots charted", f"{len(trend):,}")
